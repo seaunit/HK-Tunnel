@@ -12,7 +12,7 @@ on the server.
 | 目录 | 平台 | 形态 |
 |---|---|---|
 | [`windows/`](windows/) | Windows 10 / 11 | PowerShell + WinForms,双击即用,可接管系统代理 |
-| [`android/`](android/) | Android 8.0+ | 免 root 的 `VpnService` 全局代理,APK 见 [Releases](../../releases) |
+| [`android/`](android/) | Android 8.0+ | 免 root 的 `VpnService` 全局代理,APK 见 [Releases](/seaunit/HK-Tunnel/releases) |
 
 两边都是纯客户端:你只需要一台能 SSH 登录的服务器(任意发行版均可)。
 
@@ -20,7 +20,7 @@ on the server.
 
 ### Android
 
-1. 到 [Releases](../../releases) 下载 `app-release.apk`
+1. 到 [Releases](/seaunit/HK-Tunnel/releases) 下载 `app-release.apk`
 2. 传到手机上安装(会提示"未知来源",允许即可)
 3. 填服务器地址、SSH 端口、登录用户、登录密码,点**连接**
 4. 第一次会弹 VPN 授权,同意后状态变绿即全局生效
