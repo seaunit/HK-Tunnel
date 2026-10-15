@@ -25,5 +25,6 @@
     <string name="error_password_required">请填写登录密码。</string>
     <string name="error_bad_port">端口必须是 1 到 65535 之间的数字。</string>
     <string name="error_vpn_denied">未授予 VPN 权限，无法接管全局流量。</string>
+    <string name="error_connection_lost">SSH 连接已断开，已撤下 VPN 并恢复直连。</string>
     <string name="detail_connected">出口 %1$s · 本机 SOCKS5 127.0.0.1:%2$d</string>
 </resources>

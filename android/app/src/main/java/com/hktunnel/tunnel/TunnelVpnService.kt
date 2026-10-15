@@ -22,14 +22,26 @@ class TunnelVpnService : VpnService() {
     private var socks: Socks5Server? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var coreRunning = false
+    private var healthThread: Thread? = null
 
     /** True from the moment a start is accepted until teardown finishes. */
     @Volatile
     private var engaged = false
 
+    /**
+     * Teardown runs from several places (the stop action, onRevoke, onDestroy
+     * and the health monitor). Only the first one should act, so a later
+     * onDestroy cannot wipe out the final state the first one reported.
+     */
+    @Volatile
+    private var stopped = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            Thread({ shutdown() }, "tunnel-stop").start()
+            Thread({
+                shutdown()
+                TunnelBus.setState(TunnelState.Idle)
+            }, "tunnel-stop").start()
             return START_NOT_STICKY
         }
 
@@ -64,7 +76,10 @@ class TunnelVpnService : VpnService() {
 
     override fun onRevoke() {
         TunnelBus.log("系统撤销了 VPN 授权，正在断开。")
-        Thread({ shutdown() }, "tunnel-revoke").start()
+        Thread({
+            shutdown()
+            TunnelBus.setState(TunnelState.Idle)
+        }, "tunnel-revoke").start()
     }
 
     override fun onDestroy() {
@@ -73,6 +88,7 @@ class TunnelVpnService : VpnService() {
     }
 
     private fun launch(config: ProxyConfig) {
+        stopped = false
         try {
             TunnelBus.log("正在建立 SSH 连接 ${config.user}@${config.host}:${config.sshPort} …")
             val ssh = SshTunnel(
@@ -103,6 +119,7 @@ class TunnelVpnService : VpnService() {
             TunnelBus.setState(TunnelState.Connected(config.host, config.socksPort))
             TunnelBus.log("全局代理已接管，全部流量经 ${config.host} 出口。")
             updateNotification(getString(R.string.state_connected))
+            startHealthMonitor(ssh)
         } catch (e: Exception) {
             val message = e.message ?: e.javaClass.simpleName
             TunnelBus.log("启动失败：$message")
@@ -167,6 +184,9 @@ class TunnelVpnService : VpnService() {
     }
 
     private fun shutdown() {
+        if (stopped) return
+        stopped = true
+
         if (coreRunning) {
             coreRunning = false
             try {
@@ -174,6 +194,8 @@ class TunnelVpnService : VpnService() {
             } catch (_: Throwable) {
             }
         }
+        healthThread?.interrupt()
+        healthThread = null
         socks?.stop()
         socks = null
         tunnel?.close()
@@ -188,12 +210,62 @@ class TunnelVpnService : VpnService() {
         engaged = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        TunnelBus.setState(TunnelState.Idle)
     }
 
     private fun updateNotification(text: String) {
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    /**
+     * A VPN that outlives its SSH session is worse than no tunnel at all: every
+     * connection on the device is captured and then fails, while the app still
+     * claims to be connected. Watch the session and pull the VPN down as soon as
+     * it is gone, so the phone falls back to its own network.
+     */
+    private fun startHealthMonitor(ssh: SshTunnel) {
+        healthThread = Thread({
+            while (running) {
+                try {
+                    Thread.sleep(HEALTH_CHECK_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (!running) return@Thread
+
+                if (!ssh.isConnected()) {
+                    TunnelBus.log("SSH 连接已断开，正在撤下 VPN 以免整机断网。")
+                    shutdown()
+                    TunnelBus.setState(TunnelState.Failed(getString(R.string.error_connection_lost)))
+                    notifyConnectionLost()
+                    return@Thread
+                }
+            }
+        }, "tunnel-health")
+        healthThread?.isDaemon = true
+        healthThread?.start()
+    }
+
+    private fun notifyConnectionLost() {
+        try {
+            val open = PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            getSystemService(NotificationManager::class.java).notify(
+                DISCONNECT_NOTIFICATION_ID,
+                Notification.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(R.drawable.ic_shield)
+                    .setContentTitle(getString(R.string.app_name))
+                    .setContentText(getString(R.string.error_connection_lost))
+                    .setContentIntent(open)
+                    .setAutoCancel(true)
+                    .build()
+            )
+        } catch (_: Exception) {
+        }
     }
 
     private fun buildNotification(text: String): Notification {
@@ -249,6 +321,8 @@ class TunnelVpnService : VpnService() {
 
         private const val CHANNEL_ID = "hktunnel-tunnel"
         private const val NOTIFICATION_ID = 1
+        private const val DISCONNECT_NOTIFICATION_ID = 2
+        private const val HEALTH_CHECK_INTERVAL_MS = 5_000L
         private const val SESSION_NAME = "HK-Tunnel"
 
         private const val TUNNEL_IPV4 = "198.18.0.1"

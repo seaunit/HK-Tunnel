@@ -64,6 +64,12 @@ class SshTunnel(
         session = null
     }
 
+    /**
+     * JSch clears this as soon as the socket dies, and the server-alive
+     * keepalives set in connect() make it notice a silently dropped link too.
+     */
+    fun isConnected(): Boolean = session?.isConnected == true
+
     private fun isTrusted(knownHosts: File): Boolean {
         if (!knownHosts.exists()) return false
         val entry = if (sshPort == 22) host else "[$host]:$sshPort"

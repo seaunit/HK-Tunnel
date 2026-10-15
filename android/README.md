@@ -84,6 +84,15 @@ for the lifetime of the connection.
 
 ## Known limits
 
+### When the SSH connection drops
+
+The VPN is only useful while the session behind it is alive: if the SSH link dies
+but the tun stays up, *every* connection on the device is captured and then
+fails, and the app would still claim to be connected. The service therefore
+polls the session every few seconds and, as soon as it is gone, pulls the VPN
+down, says so in the app and posts a notification — the phone goes back to its
+own network instead of silently losing access.
+
 * **UDP is not tunnelled** — an inherent property of SSH port forwarding.
   Applications that insist on QUIC or other UDP transports (some video calls,
   some games) fall back to TCP or fail; DNS is unaffected because of the mapped
