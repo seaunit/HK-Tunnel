@@ -52,6 +52,20 @@ powershell -ExecutionPolicy Bypass -File windows\HK-Tunnel.ps1 -SelfTest
 $env:HKTUNNEL_EXPECT_EXIT_IP = '<你的服务器公网 IP>'
 ```
 
+### 浏览器突然上不了网怎么办
+
+程序是靠**改写 Windows 系统代理**来接管流量的。如果它没能正常还原(比如被任务管理器强杀、
+或程序本身启动失败),系统代理就会一直指着**已经关掉的本地桥接**,表现是浏览器打不开任何网页、
+并提示"无法连接到代理服务器" —— 网络其实是好的。
+
+一条命令就能救回来:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\HK-Tunnel.ps1 -ResetProxy
+```
+
+它会结束遗留的桥接进程、还原启动前的代理设置;即使备份文件已经丢失,也会直接把系统代理关掉。
+
 ## 原理
 
 ```

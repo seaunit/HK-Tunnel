@@ -13,13 +13,15 @@
       - 双击同目录的「启动隧道.cmd」，或桌面快捷方式
       - 自检：powershell -ExecutionPolicy Bypass -File HK-Tunnel.ps1 -SelfTest
       - 系统代理自检：powershell -ExecutionPolicy Bypass -File HK-Tunnel.ps1 -SystemProxySelfTest
+      - 浏览器上不了网时急救：powershell -ExecutionPolicy Bypass -File HK-Tunnel.ps1 -ResetProxy
 #>
 [CmdletBinding()]
 param(
     [switch]$SelfTest,
     [switch]$UiSmokeTest,
     [Switch]$SystemProxySelfTest,
-    [switch]$LiveTunnelSelfTest
+    [switch]$LiveTunnelSelfTest,
+    [switch]$ResetProxy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -323,17 +325,27 @@ function Restore-SystemProxy {
 
     try {
         $backup = (Get-Content -LiteralPath $BackupPath -Raw -Encoding UTF8) | ConvertFrom-Json
-        if (Test-ProxyIsManaged -AppliedProxyServer ([string]$backup.appliedProxyServer)) {
-            Write-ProxyRegistryState -State $backup
-            Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
-            return 'restored'
-        }
+    }
+    catch {
+        # Nothing usable to restore from; no point retrying a broken file.
+        Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
+        return 'unreadable'
+    }
 
+    if (-not (Test-ProxyIsManaged -AppliedProxyServer ([string]$backup.appliedProxyServer))) {
         Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
         return 'skipped-changed'
     }
-    catch {
+
+    try {
+        Write-ProxyRegistryState -State $backup
         Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
+        return 'restored'
+    }
+    catch {
+        # Keep the backup. If the write failed we want the next run to retry,
+        # because dropping it here would strand the machine on a proxy that is
+        # no longer listening.
         return 'failed'
     }
 }
@@ -550,6 +562,47 @@ function Stop-ProxyStack {
         restored = $restored
         killed   = $killed
         state    = $state
+    }
+}
+
+# Manual escape hatch: recovers a machine whose system proxy is still pointed at
+# a bridge that is no longer running, which shows up as "the browser has no
+# internet". Works even when the backup file has already been lost.
+function Invoke-ProxyRecovery {
+    Write-Host '=== 恢复 Windows 系统代理 ===' -ForegroundColor Cyan
+
+    $before = Read-ProxyRegistryState
+    Write-Host ("当前      : ProxyEnable={0}  ProxyServer='{1}'" -f $before.proxyEnable, $before.proxyServer)
+
+    $killed = @(Stop-BridgeProcesses)
+    if ($killed.Count -gt 0) { Write-Host "遗留桥接进程: 已结束 $($killed -join ', ')" }
+    if (Test-Path -LiteralPath $ProxyStateFile) {
+        Remove-Item -LiteralPath $ProxyStateFile -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path -LiteralPath $ProxyBackupFile) {
+        Write-Host "启动前备份  : 找到,开始还原"
+        Write-Host "还原结果    : $(Restore-SystemProxy)"
+    }
+    elseif ($before.proxyEnable -eq 1) {
+        Set-ProxyRegistryValue -Name 'ProxyEnable' -Value 0 -Type 'DWord'
+        Remove-ProxyRegistryValue -Name 'ProxyServer'
+        Invoke-WinInetRefresh
+        Write-Host '启动前备份  : 没有(可能已被删除)' -ForegroundColor Yellow
+        Write-Host '处理方式    : 直接关闭系统代理' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host '启动前备份  : 没有'
+        Write-Host '系统代理本来就是关闭的,无需处理。'
+    }
+
+    $after = Read-ProxyRegistryState
+    Write-Host ("恢复后    : ProxyEnable={0}  ProxyServer='{1}'" -f $after.proxyEnable, $after.proxyServer)
+    if ($after.proxyEnable -eq 1 -and $after.proxyServer) {
+        Write-Host '注意:系统代理仍处于开启状态。' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host '完成。浏览器现在应该可以正常上网了。' -ForegroundColor Green
     }
 }
 
@@ -1171,6 +1224,11 @@ function Invoke-LiveTunnelSelfTest {
     return $ok
 }
 
+if ($ResetProxy) {
+    Invoke-ProxyRecovery
+    return
+}
+
 if ($SelfTest) {
     [void](Invoke-SelfTest)
     return
@@ -1413,8 +1471,14 @@ function Invoke-StartTunnel {
 }
 
 function Invoke-StopTunnel {
+    # Stopping must never depend on what the form currently holds: a half-typed
+    # port number used to make the button do nothing at all and leave the system
+    # proxy taken over. Fall back to the saved config, which start already wrote.
+    $c = $null
+    try { $c = Read-UiConfig } catch { $c = $null }
+    if (-not $c) { $c = Load-Config }
+
     try {
-        $c = Read-UiConfig
         $result = Stop-Tunnel -Config $c
         if ($result.proxy.restored -eq 'restored') {
             Write-Log '已恢复启动前的 Windows 系统代理设置。'
