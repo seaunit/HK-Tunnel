@@ -1,0 +1,10 @@
+# Windows launcher/build outputs: both are produced from source on first run.
+*.exe
+
+# Browser profiles that happened to live next to the tool. Contains cookies,
+# saved logins and history -- never belongs in a repository.
+chrome-profile/
+edge-profile/
+
+*.log
+*.tmp
