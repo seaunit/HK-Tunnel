@@ -50,6 +50,12 @@ public static class HKBridge
                 }
 
                 client.NoDelay = true;
+                // These deadlines only cover the request-header phase. They are
+                // cleared again before the connection is relayed, because a
+                // relayed connection may legitimately stay quiet for minutes:
+                // an API that thinks before its first token, an SSE stream with
+                // a long gap, or an HTTPS connection parked in a client's
+                // keep-alive pool between requests.
                 client.ReceiveTimeout = 30000;
                 client.SendTimeout = 30000;
                 ThreadPool.QueueUserWorkItem(new WaitCallback(HandleClient), client);
@@ -175,6 +181,7 @@ public static class HKBridge
                     remoteStream.Flush();
                 }
 
+                EnterRelayMode(client, remote);
                 Relay(clientStream, remoteStream);
                 return;
             }
@@ -246,6 +253,7 @@ public static class HKBridge
             }
             originStream.Flush();
 
+            EnterRelayMode(client, remote);
             Relay(clientStream, originStream);
         }
         catch (Exception ex)
@@ -358,6 +366,9 @@ public static class HKBridge
     {
         TcpClient client = new TcpClient();
         client.NoDelay = true;
+        // Deadlines guard the SOCKS handshake so a wedged tunnel does not pin a
+        // worker thread forever. EnterRelayMode clears them once the connection
+        // is carrying real traffic.
         client.ReceiveTimeout = 15000;
         client.SendTimeout = 15000;
         client.Connect(IPAddress.Loopback, _socksPort);
@@ -445,6 +456,38 @@ public static class HKBridge
             offset += read;
         }
         return data;
+    }
+
+    // A relayed connection is never given an idle deadline: the two peers decide
+    // when the conversation is over, and "quiet" is not the same as "dead". Liveness
+    // is left to TCP keep-alive instead, which only gives up when probes go
+    // unanswered - so a peer that vanished is still reaped, but a peer that is
+    // merely thinking, streaming slowly or holding a pooled HTTPS connection is not.
+    private static void EnterRelayMode(TcpClient client, TcpClient remote)
+    {
+        Relax(client);
+        Relax(remote);
+    }
+
+    private static void Relax(TcpClient connection)
+    {
+        try
+        {
+            connection.ReceiveTimeout = 0;
+            connection.SendTimeout = 0;
+            connection.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+            // 30s idle before the first probe, then a probe every 10s.
+            byte[] keepAlive = new byte[12];
+            BitConverter.GetBytes(30000).CopyTo(keepAlive, 0);
+            BitConverter.GetBytes(10000).CopyTo(keepAlive, 4);
+            connection.Client.IOControl(IOControlCode.KeepAliveValues, keepAlive, null);
+        }
+        catch
+        {
+            // Best effort: a stack that refuses the keep-alive tuning still gets
+            // the cleared timeouts above, which is the part that matters.
+        }
     }
 
     private static void Relay(NetworkStream client, NetworkStream remote)

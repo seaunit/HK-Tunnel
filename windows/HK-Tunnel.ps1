@@ -8,6 +8,8 @@
       4. 启动时自动清理上次遗留的隧道进程，避免异常退出后端口被占死。
       5. 零外部依赖，只用 Windows 自带的 OpenSSH 和 PowerShell 5.1+。
       6. 密码默认不落盘；勾选「记住密码」时才用 DPAPI 加密保存，只能本机本账户解密。
+      7. 隧道断开（链路抖动、服务器重启、NAT 超时）后自动重拨并重新接管系统代理；
+         重拨前先还原系统代理，免得浏览器被留在已经关闭的本地桥接上。
 
     用法：
       - 双击同目录的「启动隧道.cmd」，或桌面快捷方式
@@ -93,6 +95,9 @@ function Get-DefaultConfig {
         socksPort = 1080
         remember  = $false
         autoProxy = $true
+        # Compression only pays off on compressible payloads. Almost everything
+        # crossing this tunnel is already TLS, so it costs CPU and buys nothing.
+        compress  = $false
     }
 }
 
@@ -107,6 +112,7 @@ function Load-Config {
         if ($obj.socksPort) { $cfg.socksPort = [int]$obj.socksPort }
         if ($obj.PSObject.Properties.Name -contains 'remember') { $cfg.remember = [bool]$obj.remember }
         if ($obj.PSObject.Properties.Name -contains 'autoProxy') { $cfg.autoProxy = [bool]$obj.autoProxy }
+        if ($obj.PSObject.Properties.Name -contains 'compress') { $cfg.compress = [bool]$obj.compress }
         return $cfg
     }
     catch { return Get-DefaultConfig }
@@ -746,8 +752,9 @@ function Get-PortListeners {
 
 function Get-TunnelCommandLine {
     param($Config)
-    $parts = @(
-        '-N', '-C',
+    $parts = @('-N')
+    if ($Config.compress) { $parts += '-C' }
+    $parts += @(
         '-D', "127.0.0.1:$($Config.socksPort)",
         '-o', 'ExitOnForwardFailure=yes',
         '-o', 'ConnectTimeout=15',
@@ -1255,6 +1262,14 @@ Add-Type -AssemblyName System.Drawing
 $script:UiRunning = $true
 $cfg = Load-Config
 
+# 隧道是一个后台 ssh 进程，它可能自己死掉（链路抖动、服务器重启、NAT 超时），
+# 而窗口还显示"运行中"。下面这些记录着"当前应当活着的是什么"，看门狗靠它们判断。
+$script:TunnelConfig      = $null
+$script:TunnelPassword    = ''
+$script:WatchBusy         = $false
+$script:ReconnectAttempts = 0
+$script:MaxReconnects     = 20
+
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'HK-Tunnel  香港服务器隧道（系统代理）'
 $form.Size            = New-Object System.Drawing.Size(580, 480)
@@ -1428,9 +1443,85 @@ function Update-Ui {
     }
 }
 
+# 每 5 秒核对一次"该活着的东西是否还活着"：ssh 进程、以及（启用系统代理时）HTTP 桥接。
+# 断线就自动重拨；重拨前先把系统代理还原，免得浏览器被留在一个已经没人听的端口上，
+# 表现成"突然所有网页都打不开了"。
+function Invoke-TunnelWatchdog {
+    if (-not $script:TunnelConfig) { return }
+    if ($script:WatchBusy) { return }
+
+    $script:WatchBusy = $true
+    try {
+        $c = $script:TunnelConfig
+        $tunnelPid = Get-TunnelPid -Config $c
+
+        if (-not $tunnelPid) {
+            $script:ReconnectAttempts++
+            Write-Log "隧道连接已断开，正在自动重连（第 $($script:ReconnectAttempts) 次）…"
+
+            # 先还原系统代理再重拨：这段时间里浏览器不应该被指向一个死端口
+            [void](Stop-ProxyStack)
+
+            try {
+                $newPid = Start-Tunnel -Config $c -Password $script:TunnelPassword
+                Write-Log "自动重连成功，PID $newPid。"
+                $script:ReconnectAttempts = 0
+                if ($c.autoProxy) {
+                    $proxy = Start-ProxyStack -Config $c -TunnelPid $newPid
+                    Write-Log "系统代理已重新接管：127.0.0.1:$($proxy.port)。"
+                }
+            }
+            catch {
+                Write-Log "自动重连失败：$($_.Exception.Message)"
+                if ($script:ReconnectAttempts -ge $script:MaxReconnects) {
+                    Write-Log "连续 $($script:MaxReconnects) 次重连失败，停止自动重连。请检查服务器与网络后手动启动。"
+                    $script:TunnelConfig   = $null
+                    $script:TunnelPassword = ''
+                    [void](Stop-ProxyStack)
+                }
+            }
+
+            Update-Ui -Config $c
+            return
+        }
+
+        if (-not $c.autoProxy) { return }
+
+        $state = Get-ProxyStackState
+        $bridgeOk = $false
+        if ($state -and $state.bridgePid) {
+            $proc = Get-Process -Id ([int]$state.bridgePid) -ErrorAction SilentlyContinue
+            $bridgeOk = [bool]($proc -and $proc.ProcessName -eq 'hk-httpbridge')
+        }
+
+        if (-not $bridgeOk) {
+            Write-Log '检测到 HTTP 桥接已退出，正在重建…'
+            [void](Stop-ProxyStack)
+            try {
+                $proxy = Start-ProxyStack -Config $c -TunnelPid $tunnelPid
+                Write-Log "HTTP 桥接已重建，系统代理 127.0.0.1:$($proxy.port)。"
+            }
+            catch {
+                Write-Log "HTTP 桥接重建失败：$($_.Exception.Message)"
+            }
+            Update-Ui -Config $c
+        }
+    }
+    catch {
+        Write-Log "看门狗异常：$($_.Exception.Message)"
+    }
+    finally {
+        $script:WatchBusy = $false
+    }
+}
+
 function Invoke-StartTunnel {
     $c = $null
     $tunnelPid = $null
+    # Stop watching while a start is in flight: Start-Tunnel below pumps the
+    # message loop while it waits for the port, which would otherwise let the
+    # watchdog tick in and see "no tunnel" mid-startup.
+    $script:TunnelConfig = $null
     try {
         $c = Read-UiConfig
         $pwd = $txtPass.Text
@@ -1444,6 +1535,9 @@ function Invoke-StartTunnel {
 
         $tunnelPid = Start-Tunnel -Config $c -Password $pwd
         Write-Log "隧道已启动，PID $tunnelPid，监听 127.0.0.1:$($c.socksPort)。"
+        $script:TunnelConfig      = $c
+        $script:TunnelPassword    = $pwd
+        $script:ReconnectAttempts = 0
         if ($c.autoProxy) {
             $proxy = Start-ProxyStack -Config $c -TunnelPid $tunnelPid
             Write-Log "HTTP 桥接已启动，PID $($proxy.pid)，监听 127.0.0.1:$($proxy.port)。"
@@ -1478,10 +1572,16 @@ function Invoke-StopTunnel {
     try { $c = Read-UiConfig } catch { $c = $null }
     if (-not $c) { $c = Load-Config }
 
+    # 用户明确要求停止，看门狗就不该再把隧道拉起来
+    $script:TunnelConfig      = $null
+    $script:TunnelPassword    = ''
+    $script:ReconnectAttempts = 0
+
     try {
         $result = Stop-Tunnel -Config $c
         if ($result.proxy.restored -eq 'restored') {
             Write-Log '已恢复启动前的 Windows 系统代理设置。'
+            Write-Log '提示：在隧道开着时启动的程序（如 Codex）可能只在启动时读过一次系统代理，停隧道后需要重启它才能恢复上网。'
         }
         if ($result.killed.Count -gt 0) { Write-Log "已停止隧道，回收进程：$($result.killed -join ', ')" }
         else { Write-Log '没有发现运行中的隧道进程。' }
@@ -1551,6 +1651,11 @@ $tray.Add_MouseDoubleClick({
 
 $tray.Visible = $true
 
+# 看门狗定时器：每 5 秒核对一次隧道是否还活着，断了自动重拨
+$watchdog = New-Object System.Windows.Forms.Timer
+$watchdog.Interval = 5000
+$watchdog.Add_Tick({ Invoke-TunnelWatchdog })
+
 $form.Add_Shown({
     Write-Log '程序已就绪。填好地址、用户和密码后点「启动隧道」。'
     if ($cfg.remember -and $txtPass.Text) { Write-Log '已读取本机保存的密码。' }
@@ -1563,6 +1668,8 @@ $form.Add_Shown({
     if ($cleanup.killed.Count -gt 0) { Write-Log "已清理上次残留的隧道进程：$($cleanup.killed -join ', ')" }
     else { Write-Log '检查完毕，没有发现残留隧道进程。' }
     Update-Ui -Config $c
+
+    $watchdog.Start()
 })
 
 $form.Add_FormClosing({
@@ -1582,6 +1689,8 @@ $form.Add_FormClosing({
     }
 
     # 真正退出：关掉隧道并清理托盘图标
+    $script:TunnelConfig   = $null
+    $script:TunnelPassword = ''
     try {
         $c = Load-Config
         $result = Stop-Tunnel -Config $c
