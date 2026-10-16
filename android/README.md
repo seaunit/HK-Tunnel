@@ -4,6 +4,14 @@ The phone counterpart of the Windows tool in the parent folder: one SSH
 connection to the same Hong Kong server, used as a **device-wide proxy**. No
 root required.
 
+> **Before you use this, check your server provider's terms.** Turning a server
+> into a proxy is what cloud providers call traffic relaying (流量穿透), and the
+> cheap "lightweight" / shared plans usually forbid it. Alibaba Cloud's
+> lightweight plan, for one, says relaying traffic can get the instance **shut
+> down and locked**, and that the advertised bandwidth is a peak rather than a
+> guarantee - saturating it is itself what triggers throttling. See the parent
+> [README](../README.md) for the details and the known cases.
+
 ## How it fits together
 
 ```
