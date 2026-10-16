@@ -135,6 +135,10 @@ Get-Process ChatGPT, codex -ErrorAction SilentlyContinue | Stop-Process -Force
 反过来也成立:如果某程序必须在隧道开着时才能连外网(例如它要访问被墙的接口),那就先开隧道、
 再开程序。
 
+**同理,跑自检和测试也会踩这个坑。** `-SystemProxySelfTest` 以及 `windows/tests/` 下的
+测试都会**临时**接管系统代理再还原;如果那类"只读一次"的程序恰好在测试窗口内启动,它就会把
+临时端口记死,测试跑完依然连不上网。所以:跑测试时别同时用它们,跑完重启一次即可。
+
 ## 原理
 
 ```

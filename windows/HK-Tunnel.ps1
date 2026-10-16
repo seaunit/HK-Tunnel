@@ -1012,6 +1012,9 @@ function Invoke-SelfTest {
 function Invoke-SystemProxySelfTest {
     $ok = $true
     Write-Host '=== HK-Tunnel 系统代理与 HTTP 桥接自检 ===' -ForegroundColor Cyan
+    # 自检会临时改写系统代理再还原。有些程序只在启动那一刻读一次系统代理、之后一直沿用
+    # （例如 Codex 桌面端），它们在自检窗口内启动就会记住那个临时端口。
+    Write-Host '注意：自检期间会临时改写 Windows 系统代理；期间启动的程序（如 Codex）需重启才能恢复。' -ForegroundColor Yellow
 
     function Test-Report {
         param([string]$Name, [bool]$Passed, [string]$Detail = '')
