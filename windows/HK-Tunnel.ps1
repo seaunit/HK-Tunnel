@@ -329,6 +329,31 @@ function Test-ProxyIsManaged {
     return ([bool]$current.proxyEnable -and [string]$current.proxyServer -eq $AppliedProxyServer)
 }
 
+# HTTP 桥接的端口挑选区间（与 Start-HttpBridge 保持一致）。
+$BridgePortMin = 1081
+$BridgePortMax = 1101
+
+# 判断一段系统代理设置是否指向"我们自己"的本地端口：HTTP 桥接区间，或本工具的 SOCKS 端口。
+#
+# 为什么需要它：如果启动前系统代理就已经指着我们自己的端口（上一轮退出没走干净、
+# 或者被手动指过去），那么这份"启动前的原设置"是**不能还原**的 —— 还原它等于把系统
+# 指向一个已经没人监听的端口。表现是浏览器打不开任何网页，以及某个在隧道运行时启动、
+# 之后一直沿用该代理的程序（例如 Codex）永远提示"等待网络"。
+function Test-ProxyPointsAtOwnPort {
+    param(
+        [string]$ProxyServer,
+        [int]$SocksPort = 0
+    )
+    if ([string]::IsNullOrWhiteSpace($ProxyServer)) { return $false }
+
+    foreach ($m in [regex]::Matches($ProxyServer, '(?i)(?:127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})')) {
+        $port = [int]$m.Groups[1].Value
+        if ($port -ge $BridgePortMin -and $port -le $BridgePortMax) { return $true }
+        if ($SocksPort -gt 0 -and $port -eq $SocksPort) { return $true }
+    }
+    return $false
+}
+
 function Restore-SystemProxy {
     param([string]$BackupPath = $ProxyBackupFile)
 
@@ -348,6 +373,26 @@ function Restore-SystemProxy {
         return 'skipped-changed'
     }
 
+    # 更早的版本可能已经写下过"指向我们自己端口"的备份。这里再挡一次：
+    # 还原一个没人监听的本地端口，比不还原更糟 —— 所以直接关掉系统代理。
+    # SOCKS 端口从栈状态里取（此刻还没被删）；手动把系统代理设成 socks5h://127.0.0.1:1080 也会中招。
+    $socksPort = 0
+    $stackState = Get-ProxyStackState
+    if ($stackState -and $stackState.socksPort) { $socksPort = [int]$stackState.socksPort }
+
+    if ([bool]$backup.proxyEnable -and (Test-ProxyPointsAtOwnPort -ProxyServer ([string]$backup.proxyServer) -SocksPort $socksPort)) {
+        $backup.proxyEnable = 0
+        $backup.proxyServer = ''
+        try {
+            Write-ProxyRegistryState -State $backup
+            Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
+            return 'restored-disabled'
+        }
+        catch {
+            return 'failed'
+        }
+    }
+
     try {
         Write-ProxyRegistryState -State $backup
         Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
@@ -364,12 +409,26 @@ function Restore-SystemProxy {
 function Set-SystemProxy {
     param(
         [int]$Port,
-        [string]$BackupPath = $ProxyBackupFile
+        [string]$BackupPath = $ProxyBackupFile,
+        [int]$SocksPort = 0
     )
 
     $backup = Read-ProxyRegistryState
+
+    # 启动前系统代理本来就指着我们自己的端口时，别把这份"原设置"原样留作备份：
+    # 下次还原会把系统指回一个已经没人监听的死端口。改成"启动前代理是关的"记录。
+    $sanitisedSelfProxy = $false
+    if ([bool]$backup.proxyEnable -and (Test-ProxyPointsAtOwnPort -ProxyServer ([string]$backup.proxyServer) -SocksPort $SocksPort)) {
+        $backup.proxyEnable = 0
+        $backup.proxyServer = ''
+        $sanitisedSelfProxy = $true
+    }
+
     $backup | Add-Member -NotePropertyName appliedProxyServer -NotePropertyValue "127.0.0.1:$Port" -Force
     $backup | Add-Member -NotePropertyName appliedAt -NotePropertyValue (Get-Date).ToString('s') -Force
+    if ($sanitisedSelfProxy) {
+        $backup | Add-Member -NotePropertyName sanitisedSelfProxy -NotePropertyValue (Get-Date).ToString('s') -Force
+    }
     $backup | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $BackupPath -Encoding UTF8
 
     Set-ProxyRegistryValue -Name 'AutoConfigURL' -Value '' -Type 'String'
@@ -496,7 +555,7 @@ function Start-HttpBridge {
         $selectedPort = $ListenPort
     }
     else {
-        for ($port = 1081; $port -le 1101; $port++) {
+        for ($port = $BridgePortMin; $port -le $BridgePortMax; $port++) {
             if ($port -eq $SocksPort) { continue }
             if (Test-PortFree -Port $port) {
                 $selectedPort = $port
@@ -548,7 +607,7 @@ function Start-ProxyStack {
     try {
         $bridge = Start-HttpBridge -SocksPort ([int]$Config.socksPort)
         Save-ProxyStackState -BridgePid $bridge.pid -HttpPort $bridge.port -TunnelPid $TunnelPid -SocksPort ([int]$Config.socksPort)
-        Set-SystemProxy -Port $bridge.port
+        Set-SystemProxy -Port $bridge.port -SocksPort ([int]$Config.socksPort)
         return [pscustomobject]@{ pid = $bridge.pid; port = $bridge.port }
     }
     catch {
@@ -1588,6 +1647,9 @@ function Invoke-StopTunnel {
             Write-Log '已恢复启动前的 Windows 系统代理设置。'
             Write-Log '提示：在隧道开着时启动的程序（如 Codex）可能只在启动时读过一次系统代理，停隧道后需要重启它才能恢复上网。'
         }
+        elseif ($result.proxy.restored -eq 'restored-disabled') {
+            Write-Log '启动前的系统代理本来就指向本工具的本地端口（上次没退干净），已改为直接关闭系统代理，避免把系统指回一个已经没人监听的端口。'
+        }
         if ($result.killed.Count -gt 0) { Write-Log "已停止隧道，回收进程：$($result.killed -join ', ')" }
         else { Write-Log '没有发现运行中的隧道进程。' }
         Update-Ui -Config $c
@@ -1700,6 +1762,7 @@ $form.Add_FormClosing({
         $c = Load-Config
         $result = Stop-Tunnel -Config $c
         if ($result.proxy.restored -eq 'restored') { Write-Log '程序退出，已恢复原 Windows 系统代理设置。' }
+        elseif ($result.proxy.restored -eq 'restored-disabled') { Write-Log '程序退出：原系统代理指向本工具的本地端口，已改为关闭系统代理。' }
         if ($result.killed.Count -gt 0) { Write-Log "程序退出，已关闭隧道：$($result.killed -join ', ')" }
     }
     catch { }
